@@ -1,0 +1,50 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: hotel-bookings-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-hotel_bookings_db}
+      MYSQL_USER: ${MYSQL_USER:-app_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-app_password}
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      # Named volume so data survives `docker compose restart` / `down`
+      # (without -v). Delete the volume to get a fully fresh DB.
+      - mysql_data:/var/lib/mysql
+      # Everything in here runs once, in filename order, ONLY on first
+      # boot of an empty data directory (i.e. a fresh volume).
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mysqladmin",
+          "ping",
+          "-h",
+          "localhost",
+          "-u",
+          "root",
+          "-p${MYSQL_ROOT_PASSWORD:-rootpassword}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Optional lightweight web UI for poking at the data without a mysql
+  # client installed locally. Remove this service if you don't want it.
+  adminer:
+    image: adminer:latest
+    container_name: hotel-bookings-adminer
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
