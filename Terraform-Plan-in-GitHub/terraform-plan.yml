@@ -1,0 +1,227 @@
+name: Terraform Plan
+
+# Runs on every PR that touches the infra/ tree. Two jobs:
+#   1. fmt-check   - fast, no AWS credentials needed, fails the PR on style drift
+#   2. plan        - one run per environment (dev, prod), each using its own
+#                     OIDC-assumed AWS role, its own backend, its own tfvars
+#
+# No apply step exists anywhere in this workflow - it is plan-only by design.
+# AWS access is read-only (see the IAM policy note in infra/README.md).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform-plan.yml"
+
+# Cancel superseded runs on the same PR so force-pushes don't queue stale plans.
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write # to post/update the plan comment
+  id-token: write # to mint the OIDC token for AWS role assumption
+
+env:
+  TF_VERSION: "1.9.5"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Format check - runs once across the whole infra/ tree, no cloud
+  # access required. Fails fast before we bother assuming any AWS roles.
+  # ---------------------------------------------------------------------
+  fmt-check:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        working-directory: infra
+        run: terraform fmt -recursive -check -diff
+
+  # ---------------------------------------------------------------------
+  # Init / validate / plan - one matrix leg per environment. Each leg maps
+  # to a GitHub Environment of the same name (Settings -> Environments),
+  # so `secrets.AWS_ROLE_ARN` resolves to a different role per environment
+  # without needing per-env secret names.
+  # ---------------------------------------------------------------------
+  plan:
+    name: terraform plan (${{ matrix.environment }})
+    needs: fmt-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    environment: ${{ matrix.environment }}
+    defaults:
+      run:
+        working-directory: infra/envs/${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          # terraform_wrapper wraps the binary so its stdout/stderr get
+          # exposed as step outputs (steps.plan.outputs.stdout, .exitcode)
+          # - that's what lets us pull the plan text into the PR comment
+          # below without redirecting to a file ourselves.
+          terraform_wrapper: true
+
+      # Read-only role, scoped to plan-time permissions only (Describe*,
+      # List*, Get* on the services this stack touches). No apply
+      # permissions are granted to this role - see infra/README.md.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-terraform-plan-${{ matrix.environment }}-${{ github.run_id }}
+
+      - name: terraform init
+        id: init
+        run: terraform init -input=false
+
+      - name: terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        # Continue past a non-zero exit so we can still post whatever plan
+        # output exists (e.g. a plan that shows changes exits 0 here since
+        # we're not using -detailed-exitcode; a real error still fails the
+        # step and the job, this just makes sure the PR comment step below
+        # always runs to surface *why* it failed).
+        continue-on-error: true
+        run: |
+          terraform plan -no-color -out=tfplan.binary \
+            -var-file=terraform.tfvars
+
+      - name: terraform show (human-readable plan)
+        id: show
+        if: always()
+        run: terraform show -no-color tfplan.binary > tfplan.txt || true
+
+      # Full plan as a downloadable artifact - useful when the plan is too
+      # long for a PR comment, or when someone wants to diff it locally.
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: infra/envs/${{ matrix.environment }}/tfplan.txt
+          retention-days: 14
+
+      # Sticky comment: one comment per environment per PR, updated in
+      # place on every push rather than piling up duplicates. Long plans
+      # are truncated to stay under GitHub's comment size limit, with a
+      # pointer to the full artifact above.
+      - name: Comment plan on PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- terraform-plan-${process.env.ENVIRONMENT} -->`;
+
+            let planText = '';
+            try {
+              planText = fs.readFileSync(
+                `infra/envs/${process.env.ENVIRONMENT}/tfplan.txt`,
+                'utf8'
+              );
+            } catch (e) {
+              planText = '(no plan output was produced - check the workflow run logs)';
+            }
+
+            const maxLen = 60000; // stay comfortably under GitHub's ~65k comment limit
+            let body = planText;
+            let truncated = false;
+            if (body.length > maxLen) {
+              body = body.slice(0, maxLen);
+              truncated = true;
+            }
+
+            const statusEmoji = process.env.PLAN_OUTCOME === 'success' ? '✅' : '❌';
+            const artifactNote = truncated
+              ? '\n\n> ⚠️ Plan output truncated for the comment - see the `tfplan-' +
+                process.env.ENVIRONMENT +
+                '` workflow artifact for the full plan.'
+              : '';
+
+            const commentBody = [
+              marker,
+              `### ${statusEmoji} Terraform Plan — \`${process.env.ENVIRONMENT}\``,
+              '',
+              `**validate:** ${process.env.VALIDATE_OUTCOME} | **plan:** ${process.env.PLAN_OUTCOME}`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              body,
+              '```',
+              '',
+              '</details>',
+              artifactNote,
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find((c) => c.body.startsWith(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: commentBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody,
+              });
+            }
+
+      # Also surface the plan in the workflow's own log/summary, so it's
+      # visible even to people who only look at Checks, not PR comments.
+      - name: Add plan to job summary
+        if: always()
+        run: |
+          {
+            echo "## Terraform Plan — ${{ matrix.environment }}"
+            echo '```hcl'
+            cat tfplan.txt 2>/dev/null || echo "(no plan output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail job if plan errored
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
